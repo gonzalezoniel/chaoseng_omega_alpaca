@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pandas
+numpy
+torch
+alpaca-trade-api

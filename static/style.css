@@ -1,0 +1,15 @@
+body {
+  background: #000000;
+  color: #00FF00;
+  font-family: monospace;
+  padding: 8px;
+}
+
+#terminal {
+  white-space: pre-wrap;
+  overflow-y: scroll;
+  height: 96vh;
+  padding: 10px;
+  border: 1px solid #00FF00;
+  box-shadow: 0 0 12px #00FF00;
+}
