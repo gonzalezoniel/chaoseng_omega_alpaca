@@ -4,3 +4,4 @@ pandas
 numpy
 torch
 alpaca-trade-api
+requests
