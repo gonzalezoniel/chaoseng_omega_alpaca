@@ -6,7 +6,7 @@ import asyncio
 
 app = FastAPI()
 
-# Serve /static (CSS + JS)
+# Serve /static for CSS + JS
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 engine = ChaosEngineOmegaHybrid()
@@ -24,23 +24,35 @@ def health():
 
 @app.get("/dashboard")
 def dashboard():
-    # Simple file read for the terminal HTML
     with open("templates/dashboard.html") as f:
         return HTMLResponse(f.read())
+
+
+@app.get("/history")
+def history(limit: int = 200):
+    """
+    Return recent trade events (ENTER / EXIT) as JSON.
+    """
+    return engine.get_trade_history(limit=limit)
+
+
+@app.get("/pnl")
+def pnl():
+    """
+    Simple realized PnL summary.
+    """
+    return engine.get_pnl_summary()
 
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    # Initial message so you know the WS is connected
     await ws.send_text(">>> Connected to Chaos Engine OMEGA terminal. Waiting for first cycle...\n")
 
     while True:
         try:
             msg = await engine.live_step()
         except Exception as e:
-            # Don't let one error kill the whole WebSocket
             msg = f"ERROR in live_step: {e}"
         await ws.send_text(msg)
-        # 60 seconds per cycle (1-minute bars)
-        await asyncio.sleep(60)
+        await asyncio.sleep(60)  # 1-minute cycle
