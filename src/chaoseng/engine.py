@@ -1,8 +1,9 @@
-import json
+# chaoseng/engine.py
+
 import math
-import os
-from datetime import datetime, timezone
-from typing import Dict, List, Any
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,482 +14,511 @@ from chaoseng.model import OmegaModel
 from chaoseng.alpaca_client import AlpacaClient
 
 
+# -------------------------------
+# Config dataclass
+# -------------------------------
+
+@dataclass
+class DayTraderConfig:
+    symbols: List[str]
+
+    # Risk
+    base_risk_per_trade: float = 0.003    # 0.3% of equity per long trade
+    short_risk_factor: float = 0.6        # shorts risk = base_risk * factor
+    max_open_trades: int = 3
+
+    # Time rules (US Eastern)
+    morning_start: time = time(9, 34)
+    morning_end: time = time(11, 0)
+    afternoon_start: time = time(13, 30)
+    afternoon_end: time = time(15, 45)
+    flatten_all_at: time = time(15, 55)   # force close everything
+
+    # Holding time
+    max_hold_minutes: int = 60
+
+    # Shorting
+    enable_shorting: bool = True
+
+    # Data / features
+    lookback_bars: int = 50
+
+
+# -------------------------------
+# Helper: market regime
+# -------------------------------
+
+class MarketRegime:
+    UP_TREND = "UP_TREND"
+    DOWN_TREND = "DOWN_TREND"
+    RANGE = "RANGE"
+    CHOP = "CHOP"
+    LOW_VOL = "LOW_VOL"
+    UNKNOWN = "UNKNOWN"
+
+
+# -------------------------------
+# Core Engine
+# -------------------------------
+
 class ChaosEngineOmegaHybrid:
     """
-    Omega AI Hybrid Engine + Level-1 Adaptive Learning
-    Autonomous, pattern-aware, volatility-aware, symbol-memory AI.
+    Day-Trader ChaosEngine (REPLACES previous engine):
+
+    - Intraday only (no overnight holds)
+    - Restricted trading windows (AM + PM session)
+    - Max hold duration per position
+    - AI-driven long/short decisions
+    - Shorting enabled with safety rules
+    - Market regime detection
+    - Pattern confidence scoring
     """
 
-    def __init__(self, config_path: str = "config.json"):
-        self.device = torch.device("cpu")
-        self.model = OmegaModel().to(self.device)
-        self.model.eval()
+    def __init__(
+        self,
+        alpaca_client: AlpacaClient,
+        model: OmegaModel,
+        config: DayTraderConfig,
+        tzinfo=timezone.utc,
+    ):
+        self.alpaca = alpaca_client
+        self.model = model
+        self.cfg = config
+        self.tzinfo = tzinfo
 
-        # Load config
-        cfg = {}
-        if os.path.exists(config_path):
-            try:
-                cfg = json.load(open(config_path))
-            except:
-                cfg = {}
-        self.cfg = cfg
+    # ---------------------------
+    # Public entrypoint
+    # ---------------------------
 
-        # Alpaca client
-        self.alpaca = AlpacaClient(config_path=config_path)
-        self.tickers = self.alpaca.tickers
+    def run_cycle(self) -> None:
+        """
+        One full decision cycle:
+        - Get positions
+        - Intraday housekeeping (flatten near close, max hold)
+        - If within trading hours: evaluate signals and trade
+        """
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone(self.tzinfo)
 
-        # Runtime state
-        self.position_meta: Dict[str, Dict[str, Any]] = {}
-        self.start_equity = self.alpaca.get_account_equity()
-        self.trade_log: List[Dict[str, Any]] = []
+        # Fetch current positions once
+        positions = self.alpaca.get_open_positions()  # expected: dict[symbol] -> info
 
-        # Telegram
-        self.telegram_token = cfg.get("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
-        self.telegram_chat_id = cfg.get("TELEGRAM_CHAT_ID") or os.getenv("TELEGRAM_CHAT_ID")
-        self.telegram_enabled = bool(self.telegram_token and self.telegram_chat_id)
+        # Housekeeping: flatten near close + max hold check
+        self._intraday_housekeeping(now_local, positions)
 
-        # ----------------------------------------------------------------------
-        # LEVEL 1 ADAPTIVE LEARNING MEMORY
-        # ----------------------------------------------------------------------
-        self.pattern_memory = {}                  # pattern_sig -> PnLs
-        self.symbol_performance = {t: [] for t in self.tickers}
-        self.time_of_day_bias = {}                # hour -> PnLs
-        self.volatility_memory = []               # (vol, pnl)
-        self.dynamic_threshold = 0.50             # AI aggressiveness threshold
+        # If market closed or outside trading window: stop here
+        if not self._is_market_open() or not self._within_trading_hours(now_local):
+            return
 
-    # ==========================================================================
-    # ----------------------  DATA PREP / HELPERS  -----------------------------
-    # ==========================================================================
+        # Pull latest market data
+        bars_by_symbol = self._get_recent_bars()
 
-    def _prepare_tensor(self, df: pd.DataFrame, window: int = 60) -> torch.Tensor:
-        if df is None or len(df) < 10:
-            return None
-        if len(df) > window:
-            df = df.iloc[-window:]
+        # Detect regime (per symbol or combined)
+        regimes = {
+            symbol: self._detect_market_regime(df)
+            for symbol, df in bars_by_symbol.items()
+            if not df.empty
+        }
 
-        arr = df[["open", "high", "low", "close", "volume"]].values.astype("float32")
-        ref = arr[-1, 3] or 1.0
-        arr[:, :4] /= ref
-        vol_ref = max(arr[:, 4].mean(), 1.0)
-        arr[:, 4] /= vol_ref
+        # Evaluate and trade per symbol
+        equity = self.alpaca.get_equity()  # account equity float
 
-        return torch.tensor(arr, dtype=torch.float32).unsqueeze(1).to(self.device)
+        for symbol, df in bars_by_symbol.items():
+            if df.empty:
+                continue
 
-    def _pattern_signature(self, df: pd.DataFrame) -> str:
-        """3-candle signature for pattern memory."""
+            regime = regimes.get(symbol, MarketRegime.UNKNOWN)
+            pattern_score, direction_hint = self._pattern_signal(df, regime)
+
+            # Evaluate model (if you want AI + patterns hybrid)
+            model_dir, model_conf = self._model_signal(df)
+
+            decision = self._combine_signals(
+                regime=regime,
+                pattern_score=pattern_score,
+                pattern_dir=direction_hint,
+                model_dir=model_dir,
+                model_conf=model_conf,
+            )
+
+            # Execute decision with risk rules
+            self._execute_decision(
+                symbol=symbol,
+                decision=decision,
+                df=df,
+                equity=equity,
+                positions=positions,
+            )
+
+    # ---------------------------
+    # Time & schedule logic
+    # ---------------------------
+
+    def _is_market_open(self) -> bool:
         try:
-            last = df.iloc[-3:]
-            sigs = []
-            for _, row in last.iterrows():
-                body = row["close"] - row["open"]
-                wick_ratio = (row["high"] - row["low"]) / max(row["close"], 1e-6)
-                color = "B" if body > 0 else "R"
-                wick = "W" if wick_ratio > 0.02 else "_"
-                sigs.append(color + wick)
-            return "|".join(sigs)
-        except:
-            return "UNK"
+            clock = self.alpaca.get_clock()
+            return bool(getattr(clock, "is_open", False))
+        except Exception:
+            return False
 
-    def _ai_position_size(self, symbol: str, equity: float, probs: np.ndarray, df: pd.DataFrame) -> int:
-        conf = float(probs.max())
-        base_risk_frac = 0.01 + 0.03 * (conf - 0.5)
-        base_risk_frac = max(0.005, min(base_risk_frac, 0.05))
+    def _within_trading_hours(self, now_local: datetime) -> bool:
+        t = now_local.time()
+
+        in_morning = self.cfg.morning_start <= t <= self.cfg.morning_end
+        in_afternoon = self.cfg.afternoon_start <= t <= self.cfg.afternoon_end
+        return in_morning or in_afternoon
+
+    def _intraday_housekeeping(self, now_local: datetime, positions: Dict[str, Any]) -> None:
+        """
+        - Flatten everything at configured 'flatten_all_at' time.
+        - Enforce max holding time per position.
+        """
+        # 1) Hard flatten time
+        if now_local.time() >= self.cfg.flatten_all_at:
+            if positions:
+                for symbol in list(positions.keys()):
+                    self._close_position(symbol, reason="End of day flatten")
+            return
+
+        # 2) Max holding time enforcement
+        max_delta = timedelta(minutes=self.cfg.max_hold_minutes)
+        for symbol, pos in positions.items():
+            entry_time = self._extract_entry_time(pos)
+            if entry_time is None:
+                continue
+            hold_time = now_local - entry_time.astimezone(self.tzinfo)
+            if hold_time >= max_delta:
+                self._close_position(symbol, reason="Max hold time reached")
+
+    def _extract_entry_time(self, pos: Any) -> Optional[datetime]:
+        """
+        Extract entry time from position object/dict.
+        Adjust according to how AlpacaClient returns it.
+        """
+        t = getattr(pos, "entry_time", None) or getattr(pos, "filled_at", None)
+        if isinstance(t, datetime):
+            return t
+        # or parse ISO-8601 string if needed
+        if isinstance(t, str):
+            try:
+                return datetime.fromisoformat(t.replace("Z", "+00:00"))
+            except Exception:
+                return None
+        return None
+
+    # ---------------------------
+    # Data fetch
+    # ---------------------------
+
+    def _get_recent_bars(self) -> Dict[str, pd.DataFrame]:
+        data: Dict[str, pd.DataFrame] = {}
+        for symbol in self.cfg.symbols:
+            try:
+                df = self.alpaca.get_recent_bars(
+                    symbol,
+                    limit=self.cfg.lookback_bars,
+                )
+                # Expect df with columns: ["time", "open", "high", "low", "close", "volume"]
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    df = pd.DataFrame()
+                data[symbol] = df
+            except Exception:
+                data[symbol] = pd.DataFrame()
+        return data
+
+    # ---------------------------
+    # Market regime detection
+    # ---------------------------
+
+    def _detect_market_regime(self, df: pd.DataFrame) -> str:
+        if df.empty or len(df) < 10:
+            return MarketRegime.UNKNOWN
 
         closes = df["close"].values
-        if len(closes) < 15:
-            vol = 0.01
-        else:
-            rets = np.diff(closes[-15:]) / closes[-15:-1]
-            vol = float(np.std(rets)) or 0.01
-
-        vol_adj = 1 / (1 + 20 * vol)
-        risk_frac = base_risk_frac * vol_adj
-
-        price = closes[-1]
-        assumed_stop = 0.015
-        dollar_risk = equity * risk_frac
-        qty = dollar_risk / (price * assumed_stop)
-
-        return max(int(qty), 0)
-
-    def _should_exit_position(self, symbol: str, side: str, probs: np.ndarray, df: pd.DataFrame) -> bool:
-        meta = self.position_meta.get(symbol)
-        now = datetime.now(timezone.utc)
-
-        if meta:
-            hrs = (now - meta["entry_time"]).total_seconds() / 3600
-            if hrs > 36:
-                return True
-
-        buy_p, _, sell_p = probs
-
-        if side == "long" and sell_p > 0.55:
-            return True
-        if side == "short" and buy_p > 0.55:
-            return True
-
-        closes = df["close"].values
-        if len(closes) >= 3:
-            ret = (closes[-1] - closes[-2]) / closes[-2]
-            if side == "long" and ret < -0.01:
-                return True
-            if side == "short" and ret > 0.01:
-                return True
-
-        return False
-
-    def _pattern_bias(self, df: pd.DataFrame) -> float:
-        closes = df["close"].values
-        opens = df["open"].values
         highs = df["high"].values
         lows = df["low"].values
 
-        if len(closes) < 5:
-            return 0.0
+        window = min(len(closes), 40)
+        sub = closes[-window:]
+        x = np.arange(window)
+        # simple slope of price vs bar index
+        slope = np.polyfit(x, sub, 1)[0]
 
-        body = closes[-1] - opens[-1]
-        upper = highs[-1] - max(closes[-1], opens[-1])
-        lower = min(closes[-1], opens[-1]) - lows[-1]
-        ref = closes[-1] or 1e-6
+        # volatility via high/low range
+        rng = (highs[-window:] - lows[-window:]).mean()
+        price = closes[-1]
+        vol_ratio = rng / price if price > 0 else 0.0
 
-        body_n = body / ref
-        uw = upper / ref
-        lw = abs(lower) / ref
+        # crude classification
+        if vol_ratio < 0.001:
+            return MarketRegime.LOW_VOL
 
-        xs = np.arange(min(len(closes), 10))
+        # thresholds you can tune
+        if slope > 0 and abs(slope) > price * 0.0003:
+            return MarketRegime.UP_TREND
+        if slope < 0 and abs(slope) > price * 0.0003:
+            return MarketRegime.DOWN_TREND
+
+        # Range / chop
+        # If last N bars are oscillating around mean
+        last = sub
+        mean = last.mean()
+        dist = np.abs(last - mean)
+        mean_dist = dist.mean()
+        # If range small -> RANGE, if noisy -> CHOP
+        if mean_dist < price * 0.002:
+            return MarketRegime.RANGE
+        else:
+            return MarketRegime.CHOP
+
+    # ---------------------------
+    # Pattern signal
+    # ---------------------------
+
+    def _pattern_signal(self, df: pd.DataFrame, regime: str) -> Tuple[float, Optional[str]]:
+        """
+        Returns:
+          pattern_score: 0–1 float
+          direction_hint: "LONG" | "SHORT" | None
+        """
+        if df.empty or len(df) < 5:
+            return 0.0, None
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        o, h, l, c = last["open"], last["high"], last["low"], last["close"]
+        body = abs(c - o)
+        range_ = max(h - l, 1e-6)
+        upper_wick = h - max(c, o)
+        lower_wick = min(c, o) - l
+
+        score = 0.0
+        direction: Optional[str] = None
+
+        # Hammer (long lower wick) in uptrend / range → bullish
+        if lower_wick > 0.6 * range_ and body < 0.3 * range_:
+            if regime in (MarketRegime.UP_TREND, MarketRegime.RANGE):
+                score += 0.4
+                direction = "LONG"
+
+        # Shooting star (long upper wick) in downtrend / range → bearish
+        if upper_wick > 0.6 * range_ and body < 0.3 * range_:
+            if regime in (MarketRegime.DOWN_TREND, MarketRegime.RANGE):
+                score += 0.4
+                direction = "SHORT"
+
+        # Bullish engulfing
+        if (
+            c > o
+            and prev["close"] < prev["open"]
+            and c >= prev["open"]
+            and o <= prev["close"]
+        ):
+            if regime == MarketRegime.UP_TREND:
+                score += 0.3
+                direction = "LONG"
+
+        # Bearish engulfing
+        if (
+            c < o
+            and prev["close"] > prev["open"]
+            and c <= prev["open"]
+            and o >= prev["close"]
+        ):
+            if regime == MarketRegime.DOWN_TREND:
+                score += 0.3
+                direction = "SHORT"
+
+        # Normalize score
+        score = max(0.0, min(1.0, score))
+        return score, direction
+
+    # ---------------------------
+    # Model signal (AI component)
+    # ---------------------------
+
+    def _model_signal(self, df: pd.DataFrame) -> Tuple[Optional[str], float]:
+        """
+        Use your OmegaModel to get direction + confidence.
+        Adjust this to match how your model expects features.
+        """
+        if df.empty:
+            return None, 0.0
+
         try:
-            slope = float(np.polyfit(xs, closes[-len(xs):], 1)[0]) / ref
-        except:
-            slope = 0
+            features = self._build_features(df)
+            logits = self.model(features)  # shape [1, 3] for [short, flat, long] for example
+            probs = F.softmax(logits, dim=-1).detach().cpu().numpy()[0]
 
-        bias = 0.0
-        if body_n > 0 and lw > uw * 1.3 and slope > 0:
-            bias += 0.15
-        if body_n < 0 and uw > lw * 1.3 and slope < 0:
-            bias -= 0.15
+            short_p, flat_p, long_p = probs.tolist()
+            max_p = max(probs)
+            if max_p < 0.4:
+                return None, max_p
 
-        if slope > 0.001:
-            bias += 0.10
-        if slope < -0.001:
-            bias -= 0.10
+            if long_p == max_p:
+                return "LONG", max_p
+            if short_p == max_p:
+                return "SHORT", max_p
+            return None, max_p
+        except Exception:
+            return None, 0.0
 
-        return max(-0.3, min(0.3, bias))
+    def _build_features(self, df: pd.DataFrame) -> torch.Tensor:
+        """
+        Simple feature builder. Replace/extend with your actual one.
+        """
+        closes = df["close"].values.astype(np.float32)
+        returns = np.diff(closes) / closes[:-1]
+        pad_len = max(0, 50 - len(returns))
+        if pad_len > 0:
+            returns = np.pad(returns, (pad_len, 0), mode="constant")
+        else:
+            returns = returns[-50:]
 
-    # ==========================================================================
-    # ---------------------------- LOGGING -------------------------------------
-    # ==========================================================================
+        x = torch.from_numpy(returns).unsqueeze(0)  # shape [1, 50]
+        return x
 
-    def _log_trade(
+    # ---------------------------
+    # Decision fusion
+    # ---------------------------
+
+    def _combine_signals(
         self,
-        kind: str,
+        regime: str,
+        pattern_score: float,
+        pattern_dir: Optional[str],
+        model_dir: Optional[str],
+        model_conf: float,
+    ) -> Dict[str, Any]:
+        """
+        Combines pattern + model into a unified decision dict.
+        """
+        # If regime is low-vol or chop, be very conservative
+        if regime in (MarketRegime.LOW_VOL, MarketRegime.CHOP):
+            if pattern_score < 0.7 or (model_conf < 0.55):
+                return {"action": "HOLD"}
+
+        # Base decision from pattern
+        decision_dir = pattern_dir
+        confidence = pattern_score
+
+        # If model agrees with pattern, boost confidence
+        if model_dir is not None and pattern_dir is not None and model_dir == pattern_dir:
+            confidence = min(1.0, pattern_score + 0.25 * model_conf)
+
+        # If model contradicts strongly, neutralize
+        if model_dir is not None and pattern_dir is not None and model_dir != pattern_dir:
+            if model_conf > 0.6:
+                return {"action": "HOLD"}
+
+        if confidence < 0.5 or decision_dir is None:
+            return {"action": "HOLD"}
+
+        return {"action": "ENTER", "direction": decision_dir, "confidence": confidence}
+
+    # ---------------------------
+    # Execution & risk mgmt
+    # ---------------------------
+
+    def _execute_decision(
+        self,
         symbol: str,
-        side: str,
-        qty: float,
-        score: float = None,
-        probs: np.ndarray = None,
-        entry_price: float = None,
-        exit_price: float = None,
-        pnl: float = None,
-    ):
-        now = datetime.now(timezone.utc).isoformat()
-        buy_p = hold_p = sell_p = None
+        decision: Dict[str, Any],
+        df: pd.DataFrame,
+        equity: float,
+        positions: Dict[str, Any],
+    ) -> None:
+        action = decision.get("action", "HOLD")
 
-        if probs is not None and len(probs) == 3:
-            buy_p, hold_p, sell_p = [float(x) for x in probs]
-
-        self.trade_log.append({
-            "timestamp": now,
-            "kind": kind,
-            "symbol": symbol,
-            "side": side,
-            "qty": float(qty),
-            "score": float(score) if score else None,
-            "buy_p": buy_p,
-            "hold_p": hold_p,
-            "sell_p": sell_p,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "pnl": pnl,
-        })
-
-        # Telegram
-        try:
-            if kind == "ENTER":
-                msg = f"ENTER {symbol} {side} x{qty} @ {entry_price:.2f}"
-            elif kind == "EXIT":
-                msg = f"EXIT {symbol} {side} x{qty} @ {exit_price:.2f} PnL={pnl:.2f}"
-            else:
-                msg = None
-
-            if msg:
-                self._send_telegram(msg)
-        except:
-            pass
-
-    def _send_telegram(self, text: str):
-        if not self.telegram_enabled:
+        if action == "HOLD":
             return
-        try:
-            import requests
-            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-            requests.post(url, data={"chat_id": self.telegram_chat_id, "text": text}, timeout=5)
-        except:
-            pass
 
-    # ==========================================================================
-    # ---------------------- PUBLIC API (Dashboard) ----------------------------
-    # ==========================================================================
+        # Don't exceed max open trades
+        if len(positions) >= self.cfg.max_open_trades:
+            return
 
-    def get_trade_history(self, limit=200):
-        return self.trade_log[-limit:]
+        direction = decision.get("direction")
+        confidence = decision.get("confidence", 0.0)
 
-    def get_pnl_summary(self):
-        exits = [t for t in self.trade_log if t["kind"] == "EXIT" and t["pnl"] is not None]
-        if not exits:
-            return {
-                "total_realized_pnl": 0.0,
-                "num_trades": 0,
-                "win_rate": 0.0,
-                "avg_win": 0.0,
-                "avg_loss": 0.0,
-                "max_win": 0.0,
-                "max_loss": 0.0,
-            }
+        # If direction is SHORT but shorting disabled or conditions unsafe, skip
+        if direction == "SHORT" and not self.cfg.enable_shorting:
+            return
 
-        pnls = [t["pnl"] for t in exits]
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p < 0]
+        price = float(df["close"].iloc[-1])
 
-        return {
-            "total_realized_pnl": sum(pnls),
-            "num_trades": len(pnls),
-            "win_rate": len(wins) / len(pnls),
-            "avg_win": sum(wins)/len(wins) if wins else 0,
-            "avg_loss": sum(losses)/len(losses) if losses else 0,
-            "max_win": max(wins) if wins else 0,
-            "max_loss": min(losses) if losses else 0,
-        }
+        # Determine stop distance based on volatility
+        atr = self._estimate_atr(df)
+        if atr is None or atr <= 0:
+            stop_dist = price * 0.004  # fallback ~0.4%
+        else:
+            stop_dist = max(price * 0.002, atr * 0.6)
 
-    # ==========================================================================
-    # ---------------------------- MAIN LIVE STEP ------------------------------
-    # ==========================================================================
+        # Risk per trade
+        risk_fraction = self.cfg.base_risk_per_trade
+        if direction == "SHORT":
+            risk_fraction *= self.cfg.short_risk_factor
 
-    async def live_step(self) -> str:
-        now = datetime.now(timezone.utc)
-        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        equity = self.alpaca.get_account_equity()
+        risk_dollars = equity * risk_fraction
 
-        ticker_logs = []
-        best_symbol = None
-        best_score = 0
-        best_side = "hold"
-        best_probs = None
-        best_df = None
-        best_vol = None
-        best_pattern = None
+        qty = max(1, int(risk_dollars / stop_dist))
 
-        # ------------------------- Evaluate each ticker -----------------------
-        for symbol in self.tickers:
-            df = self.alpaca.get_recent_bars(symbol, timeframe="1Min", limit=120)
-            if df is None or len(df) < 20:
-                ticker_logs.append(f"{symbol}: insufficient data")
-                continue
+        # Safety: don't send absurd size
+        if qty <= 0:
+            return
 
-            x = self._prepare_tensor(df)
-            if x is None:
-                ticker_logs.append(f"{symbol}: not enough candles")
-                continue
+        # Entry + stop/target
+        if direction == "LONG":
+            stop_price = price - stop_dist
+            # simple reward: 1.5R
+            take_profit = price + stop_dist * 1.5
+            self.alpaca.submit_bracket_order(
+                symbol=symbol,
+                side="buy",
+                qty=qty,
+                entry_price=None,  # market
+                stop_price=stop_price,
+                take_profit_price=take_profit,
+            )
+        elif direction == "SHORT":
+            # extra guard: don't short in strong uptrend regime
+            regime = self._detect_market_regime(df)
+            if regime == MarketRegime.UP_TREND:
+                return
 
-            with torch.no_grad():
-                probs = F.softmax(self.model(x), dim=-1)[0].cpu().numpy()
-
-            buy_p, hold_p, sell_p = probs
-
-            # Pattern bias
-            bias = self._pattern_bias(df)
-
-            buy_adj = buy_p + max(0, bias)
-            sell_adj = sell_p + max(0, -bias)
-            hold_adj = hold_p
-            total = buy_adj + hold_adj + sell_adj
-            if total > 0:
-                buy_adj /= total
-                hold_adj /= total
-                sell_adj /= total
-
-            probs_adj = np.array([buy_adj, hold_adj, sell_adj])
-            max_p = probs_adj.max()
-
-            # Dynamic threshold decides if attempt is valid
-            if max_p < self.dynamic_threshold:
-                side = "hold"
-            elif buy_adj > sell_adj:
-                side = "long"
-            else:
-                side = "short"
-
-            closes = df["close"].values
-            if len(closes) < 10:
-                vol = 0.01
-            else:
-                rets = np.diff(closes[-10:]) / closes[-10:-1]
-                vol = float(np.std(rets)) or 0.01
-
-            vol_score = 1 + min(vol*100, 1)
-
-            pattern = self._pattern_signature(df)
-            pattern_bonus = 1 + abs(bias)
-
-            # Adaptive learning influences
-            # Pattern memory
-            if pattern in self.pattern_memory and len(self.pattern_memory[pattern]) >= 2:
-                avgp = sum(self.pattern_memory[pattern]) / len(self.pattern_memory[pattern])
-                pattern_bonus *= 1.10 if avgp > 0 else 0.90
-
-            # Symbol performance
-            if len(self.symbol_performance[symbol]) >= 3:
-                avg_perf = sum(self.symbol_performance[symbol][-3:]) / 3
-                pattern_bonus *= 1.05 if avg_perf > 0 else 0.95
-
-            # Time-of-day
-            hr = now.hour
-            if hr in self.time_of_day_bias and len(self.time_of_day_bias[hr]) >= 2:
-                avg_hr = sum(self.time_of_day_bias[hr]) / len(self.time_of_day_bias[hr])
-                pattern_bonus *= 1.03 if avg_hr > 0 else 0.97
-
-            # Volatility memory
-            if len(self.volatility_memory) >= 5:
-                close_vol = [p for v, p in self.volatility_memory[-20:] if abs(v - vol) < 0.005]
-                if close_vol:
-                    avg_volp = sum(close_vol)/len(close_vol)
-                    pattern_bonus *= 1.04 if avg_volp > 0 else 0.96
-
-            score = max_p * vol_score * pattern_bonus
-
-            ticker_logs.append(
-                f"{symbol}: BUY={buy_adj:.2f} HOLD={hold_adj:.2f} SELL={sell_adj:.2f} "
-                f"SIDE={side} SCORE={score:.2f}"
+            stop_price = price + stop_dist
+            take_profit = price - stop_dist * 1.5
+            self.alpaca.submit_bracket_order(
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                entry_price=None,
+                stop_price=stop_price,
+                take_profit_price=take_profit,
             )
 
-            if score > best_score and side != "hold":
-                best_score = score
-                best_symbol = symbol
-                best_side = side
-                best_probs = probs_adj
-                best_df = df
-                best_vol = vol
-                best_pattern = pattern
+    def _estimate_atr(self, df: pd.DataFrame, period: int = 14) -> Optional[float]:
+        if len(df) < period + 1:
+            return None
+        highs = df["high"].values
+        lows = df["low"].values
+        closes = df["close"].values
 
-        # ==========================================================================
-        # ----------------------------- EXIT LOGIC ---------------------------------
-        # ==========================================================================
-        action_logs = []
+        trs = []
+        for i in range(1, period + 1):
+            high = highs[-i]
+            low = lows[-i]
+            prev_close = closes[-i - 1]
+            tr = max(
+                high - low,
+                abs(high - prev_close),
+                abs(low - prev_close),
+            )
+            trs.append(tr)
+        return float(np.mean(trs))
 
-        for symbol in self.tickers:
-            qty, _ = self.alpaca.get_open_position(symbol)
-            if qty == 0:
-                continue
-
-            meta = self.position_meta.get(symbol)
-            if not meta:
-                continue
-
-            side = meta["side"]
-
-            df = self.alpaca.get_recent_bars(symbol, "1Min", 120)
-            x = self._prepare_tensor(df)
-            if x is None:
-                continue
-
-            with torch.no_grad():
-                p = F.softmax(self.model(x), dim=-1)[0].cpu().numpy()
-
-            if self._should_exit_position(symbol, side, p, df):
-                closes = df["close"].values
-                exit_price = float(closes[-1])
-                entry_price = float(meta["entry_price"])
-                size = float(meta["qty"])
-
-                if side == "long":
-                    pnl = (exit_price - entry_price) * size
-                else:
-                    pnl = (entry_price - exit_price) * size
-
-                self.alpaca.close_position(symbol)
-                self.position_meta.pop(symbol, None)
-
-                self._log_trade(
-                    "EXIT",
-                    symbol,
-                    side,
-                    size,
-                    probs=p,
-                    entry_price=entry_price,
-                    exit_price=exit_price,
-                    pnl=pnl,
-                )
-
-                # Adaptive updates
-                self.symbol_performance[symbol].append(pnl)
-                hour = now.hour
-                self.time_of_day_bias.setdefault(hour, []).append(pnl)
-                if best_vol is not None:
-                    self.volatility_memory.append((best_vol, pnl))
-                if best_pattern is not None:
-                    self.pattern_memory.setdefault(best_pattern, []).append(pnl)
-
-                if pnl > 0:
-                    self.dynamic_threshold = max(0.45, self.dynamic_threshold - 0.01)
-                else:
-                    self.dynamic_threshold = min(0.60, self.dynamic_threshold + 0.01)
-
-                action_logs.append(
-                    f"EXIT {symbol.upper()} {side.upper()} x{int(size)} @ {exit_price:.2f} "
-                    f"PnL={pnl:.2f} (learning updated)"
-                )
-
-        # ==========================================================================
-        # ----------------------------- ENTRY LOGIC --------------------------------
-        # ==========================================================================
-        if best_symbol and best_probs is not None and best_df is not None:
-            qty, _ = self.alpaca.get_open_position(best_symbol)
-            if qty == 0:
-                size = self._ai_position_size(best_symbol, equity, best_probs, best_df)
-
-                if size > 0:
-                    entry_price = float(best_df["close"].values[-1])
-                    side_str = "buy" if best_side == "long" else "sell"
-
-                    self.alpaca.submit_market_order(best_symbol, size, side_str)
-
-                    self.position_meta[best_symbol] = {
-                        "entry_time": datetime.now(timezone.utc),
-                        "side": best_side,
-                        "entry_price": entry_price,
-                        "qty": size,
-                    }
-
-                    self._log_trade(
-                        "ENTER",
-                        best_symbol,
-                        best_side,
-                        size,
-                        score=best_score,
-                        probs=best_probs,
-                        entry_price=entry_price,
-                    )
-
-                    action_logs.append(
-                        f"ENTER {best_symbol.upper()} {side_str.upper()} x{size} "
-                        f"@ {entry_price:.2f} (score={best_score:.2f})"
-                    )
-
-        # ==========================================================================
-        # ----------------------------- OUTPUT LOG ---------------------------------
-        # ==========================================================================
-        header = f"[{now_str}] EQUITY={equity:.2f}"
-        tick_block = "\n".join(ticker_logs)
-        act_block = "\n".join(action_logs) if action_logs else "No new orders this cycle."
-        sep = "-"*40
-
-        return f"{header}\n{tick_block}\n{act_block}\n{sep}"
+    def _close_position(self, symbol: str, reason: str = "") -> None:
+        try:
+            self.alpaca.close_position(symbol)
+        except Exception:
+            pass
