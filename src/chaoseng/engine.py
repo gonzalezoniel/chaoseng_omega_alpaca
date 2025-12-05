@@ -76,15 +76,35 @@ class ChaosEngineOmegaHybrid:
 
     def __init__(
         self,
-        alpaca_client: AlpacaClient,
-        model: OmegaModel,
-        config: DayTraderConfig,
-        tzinfo=timezone.utc,
+        alpaca_client: Optional[AlpacaClient] = None,
+        model: Optional[OmegaModel] = None,
+        config: Optional[DayTraderConfig] = None,
+        tzinfo: timezone = timezone.utc,
     ):
+        """
+        Make this compatible with your existing main.py which calls
+        ChaosEngineOmegaHybrid() with no arguments.
+
+        - If nothing is passed, we build AlpacaClient, OmegaModel, and a default
+          DayTraderConfig internally.
+        - If you later want to construct it manually, you can still do:
+            ChaosEngineOmegaHybrid(alpaca_client=..., model=..., config=...)
+        """
+        if config is None:
+            # You can edit this symbol list to whatever you're actually trading
+            config = DayTraderConfig(symbols=["SPY", "QQQ", "TSLA", "NVDA"])
+
+        if alpaca_client is None:
+            alpaca_client = AlpacaClient()  # uses your existing implementation
+
+        if model is None:
+            model = OmegaModel()  # uses your existing default/weights loading
+
         self.alpaca = alpaca_client
         self.model = model
         self.cfg = config
         self.tzinfo = tzinfo
+
 
     # ---------------------------
     # Public entrypoint
