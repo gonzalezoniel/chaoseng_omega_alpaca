@@ -23,9 +23,19 @@ def health():
 
 
 @app.get("/dashboard")
-def dashboard():
-    with open("templates/dashboard.html") as f:
-        return HTMLResponse(f.read())
+async def dashboard():
+    try:
+        engine.run_cycle()
+        return HTMLResponse("""
+        >>> Connected to Chaos Engine OMEGA terminal.<br>
+        Waiting for next cycle...<br>
+        <span style="color: #00FF00;">Engine cycle executed successfully.</span>
+        """)
+    except Exception as e:
+        return HTMLResponse(f"""
+        ERROR in cycle:<br>
+        <span style="color: #FF4444;">{str(e)}</span>
+        """)
 
 
 @app.get("/history")
