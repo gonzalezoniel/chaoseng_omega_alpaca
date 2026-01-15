@@ -107,12 +107,32 @@ class AlpacaClient:
 
         return df[cols].copy()
 
+    def get_open_positions(self) -> dict:
+        """
+        Return a dict of open positions keyed by symbol.
+        """
+        try:
+            positions = self.api.list_positions()
+        except Exception:
+            return {}
+
+        return {pos.symbol: pos for pos in positions}
+
+    def get_clock(self):
+        return self.api.get_clock()
+
+    def get_account(self):
+        return self.api.get_account()
+
     # -------------------------------------------------------------------------
     # Account / positions
     # -------------------------------------------------------------------------
     def get_account_equity(self) -> float:
         acct = self.api.get_account()
         return float(acct.equity)
+
+    def get_equity(self) -> float:
+        return self.get_account_equity()
 
     def get_open_position(self, symbol: str):
         """
@@ -164,3 +184,84 @@ class AlpacaClient:
             print(f"[AlpacaClient] Order error for {symbol}: {e}")
             return None
 
+    def submit_bracket_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        entry_price: float | None,
+        stop_price: float,
+        take_profit_price: float,
+    ):
+        """
+        Submit a bracket order with optional limit entry.
+        """
+        side = side.lower().strip()
+        if qty <= 0 or side not in ("buy", "sell"):
+            return None
+
+        order_kwargs = {
+            "symbol": symbol,
+            "qty": qty,
+            "side": side,
+            "time_in_force": "day",
+            "order_class": "bracket",
+            "take_profit": {"limit_price": take_profit_price},
+            "stop_loss": {"stop_price": stop_price},
+        }
+
+        if entry_price is None:
+            order_kwargs["type"] = "market"
+        else:
+            order_kwargs["type"] = "limit"
+            order_kwargs["limit_price"] = entry_price
+
+        try:
+            return self.api.submit_order(**order_kwargs)
+        except Exception as e:
+            print(f"[AlpacaClient] Bracket order error for {symbol}: {e}")
+            return None
+
+    def get_trade_history(self, limit: int = 200) -> list[dict]:
+        """
+        Return a recent list of filled orders (enter/exit).
+        """
+        try:
+            orders = self.api.list_orders(status="closed", limit=limit)
+        except Exception:
+            return []
+
+        history = []
+        for order in orders:
+            filled_at = getattr(order, "filled_at", None)
+            if filled_at is None:
+                continue
+            history.append(
+                {
+                    "id": getattr(order, "id", None),
+                    "symbol": getattr(order, "symbol", None),
+                    "side": getattr(order, "side", None),
+                    "qty": getattr(order, "filled_qty", None),
+                    "filled_avg_price": getattr(order, "filled_avg_price", None),
+                    "filled_at": filled_at.isoformat() if hasattr(filled_at, "isoformat") else str(filled_at),
+                    "type": getattr(order, "type", None),
+                    "status": getattr(order, "status", None),
+                }
+            )
+        return history
+
+    def get_pnl_summary(self) -> dict:
+        """
+        Return a simple PnL/equity snapshot.
+        """
+        acct = self.api.get_account()
+        summary = {
+            "equity": float(getattr(acct, "equity", 0.0)),
+            "last_equity": float(getattr(acct, "last_equity", 0.0)),
+            "portfolio_value": float(getattr(acct, "portfolio_value", 0.0)),
+            "cash": float(getattr(acct, "cash", 0.0)),
+            "buying_power": float(getattr(acct, "buying_power", 0.0)),
+            "unrealized_pl": float(getattr(acct, "unrealized_pl", 0.0)),
+            "unrealized_plpc": float(getattr(acct, "unrealized_plpc", 0.0)),
+        }
+        return summary
