@@ -265,3 +265,4 @@ class AlpacaClient:
             "unrealized_plpc": float(getattr(acct, "unrealized_plpc", 0.0)),
         }
         return summary
+        
