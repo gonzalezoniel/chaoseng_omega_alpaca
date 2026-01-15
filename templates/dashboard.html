@@ -2,10 +2,75 @@
 <html>
 <head>
   <title>Chaos Engine OMEGA – Alpaca Hybrid Terminal</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <div id="terminal"></div>
+  <main class="layout">
+    <header class="topbar">
+      <div>
+        <h1>Chaos Engine OMEGA</h1>
+        <p class="subtitle">Alpaca Hybrid Terminal · Live trading telemetry</p>
+      </div>
+      <div class="status">
+        <div class="status-item">
+          <span class="label">WebSocket</span>
+          <span id="ws-status" class="pill">connecting</span>
+        </div>
+        <div class="status-item">
+          <span class="label">Last update</span>
+          <span id="last-update" class="pill">--</span>
+        </div>
+      </div>
+    </header>
+
+    {% if engine_error %}
+    <section class="alert">
+      <strong>Engine unavailable:</strong> {{ engine_error }}
+      <span>Set ALPACA_API_KEY / ALPACA_SECRET_KEY and redeploy to enable live cycles.</span>
+    </section>
+    {% endif %}
+
+    <section class="panel">
+      <div class="panel-header">
+        <h2>Terminal Output</h2>
+        <div class="controls">
+          <button id="clear-terminal" class="ghost">Clear</button>
+          <button id="pause-terminal" class="ghost">Pause</button>
+        </div>
+      </div>
+      <div id="terminal" aria-live="polite"></div>
+    </section>
+
+    <section class="panel panel-compact">
+      <div class="panel-header">
+        <h2>Engine Snapshot</h2>
+      </div>
+      <div class="snapshot-grid">
+        <div class="snapshot-card">
+          <span class="label">Watchlist</span>
+          <span id="watchlist" class="snapshot-value">--</span>
+        </div>
+        <div class="snapshot-card">
+          <span class="label">Open positions</span>
+          <span id="positions" class="snapshot-value">--</span>
+        </div>
+        <div class="snapshot-card">
+          <span class="label">Market open</span>
+          <span id="market-open" class="snapshot-value">--</span>
+        </div>
+        <div class="snapshot-card">
+          <span class="label">Trading window</span>
+          <span id="trading-window" class="snapshot-value">--</span>
+        </div>
+      </div>
+      <div class="regime">
+        <span class="label">Latest regimes</span>
+        <pre id="regimes" class="regime-box">--</pre>
+      </div>
+    </section>
+  </main>
   <script src="/static/dashboard.js"></script>
 </body>
 </html>
