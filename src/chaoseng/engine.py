@@ -105,6 +105,8 @@ class ChaosEngineOmegaHybrid:
         self.model = model
         self.cfg = config
         self.tzinfo = tzinfo
+        self.last_cycle_at: Optional[datetime] = None
+        self.last_cycle_summary: Optional[Dict[str, Any]] = None
 
 
     # ---------------------------
@@ -120,6 +122,7 @@ class ChaosEngineOmegaHybrid:
         """
         now_utc = datetime.now(timezone.utc)
         now_local = now_utc.astimezone(self.tzinfo)
+        self.last_cycle_at = now_utc
 
         # Fetch current positions once
         positions = self.alpaca.get_open_positions()  # expected: dict[symbol] -> info
@@ -128,7 +131,16 @@ class ChaosEngineOmegaHybrid:
         self._intraday_housekeeping(now_local, positions)
 
         # If market closed or outside trading window: stop here
-        if not self._is_market_open() or not self._within_trading_hours(now_local):
+        market_open = self._is_market_open()
+        within_hours = self._within_trading_hours(now_local)
+        if not market_open or not within_hours:
+            self._set_cycle_summary(
+                now_utc,
+                positions=positions,
+                market_open=market_open,
+                within_hours=within_hours,
+                regimes={},
+            )
             return
 
         # Pull latest market data
@@ -170,6 +182,13 @@ class ChaosEngineOmegaHybrid:
                 equity=equity,
                 positions=positions,
             )
+        self._set_cycle_summary(
+            now_utc,
+            positions=positions,
+            market_open=market_open,
+            within_hours=within_hours,
+            regimes=regimes,
+        )
 
     async def live_step(self) -> str:
         """
@@ -180,18 +199,51 @@ class ChaosEngineOmegaHybrid:
         except Exception as exc:
             return f"ERROR in run_cycle: {exc}"
 
-        try:
-            positions = self.alpaca.get_open_positions()
-            symbols = ", ".join(sorted(positions.keys())) if positions else "none"
-            return f"Cycle complete. Open positions: {symbols}"
-        except Exception as exc:
-            return f"Cycle complete. (Could not fetch positions: {exc})"
+        summary = self.get_status()
+        open_positions = summary.get("open_positions", [])
+        open_symbols = ", ".join(open_positions) if open_positions else "none"
+        watchlist = ", ".join(summary.get("symbols", []))
+        market_state = "open" if summary.get("market_open") else "closed"
+        within_hours = "yes" if summary.get("within_trading_hours") else "no"
+        return (
+            "Cycle complete.\n"
+            f"Market: {market_state} | Trading window: {within_hours}\n"
+            f"Watchlist: {watchlist}\n"
+            f"Open positions: {open_symbols}"
+        )
 
     def get_trade_history(self, limit: int = 200) -> List[Dict[str, Any]]:
         return self.alpaca.get_trade_history(limit=limit)
 
     def get_pnl_summary(self) -> Dict[str, Any]:
         return self.alpaca.get_pnl_summary()
+
+    def get_status(self) -> Dict[str, Any]:
+        summary = self.last_cycle_summary or {}
+        return {
+            "symbols": self.cfg.symbols,
+            "market_open": summary.get("market_open", False),
+            "within_trading_hours": summary.get("within_trading_hours", False),
+            "open_positions": summary.get("open_positions", []),
+            "regimes": summary.get("regimes", {}),
+            "last_cycle_at": summary.get("last_cycle_at"),
+        }
+
+    def _set_cycle_summary(
+        self,
+        now_utc: datetime,
+        positions: Dict[str, Any],
+        market_open: bool,
+        within_hours: bool,
+        regimes: Dict[str, str],
+    ) -> None:
+        self.last_cycle_summary = {
+            "last_cycle_at": now_utc.isoformat(),
+            "market_open": market_open,
+            "within_trading_hours": within_hours,
+            "open_positions": sorted(list(positions.keys())),
+            "regimes": regimes,
+        }
 
     # ---------------------------
     # Time & schedule logic
