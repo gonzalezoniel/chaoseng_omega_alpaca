@@ -1,6 +1,6 @@
-from fastapi import FastAPI, WebSocket
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from chaoseng.engine import ChaosEngineOmegaHybrid
 import asyncio
 
@@ -8,6 +8,7 @@ app = FastAPI()
 
 # Serve /static for CSS + JS
 app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
 
 engine = ChaosEngineOmegaHybrid()
 
@@ -23,19 +24,8 @@ def health():
 
 
 @app.get("/dashboard")
-async def dashboard():
-    try:
-        engine.run_cycle()
-        return HTMLResponse("""
-        >>> Connected to Chaos Engine OMEGA terminal.<br>
-        Waiting for next cycle...<br>
-        <span style="color: #00FF00;">Engine cycle executed successfully.</span>
-        """)
-    except Exception as e:
-        return HTMLResponse(f"""
-        ERROR in cycle:<br>
-        <span style="color: #FF4444;">{str(e)}</span>
-        """)
+async def dashboard(request: Request):
+    return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
 @app.get("/history")
