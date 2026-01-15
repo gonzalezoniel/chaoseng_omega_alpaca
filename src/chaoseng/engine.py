@@ -1,5 +1,6 @@
 # chaoseng/engine.py
 
+import asyncio
 import math
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -169,6 +170,28 @@ class ChaosEngineOmegaHybrid:
                 equity=equity,
                 positions=positions,
             )
+
+    async def live_step(self) -> str:
+        """
+        Async wrapper around a single cycle, returning a short status line.
+        """
+        try:
+            await asyncio.to_thread(self.run_cycle)
+        except Exception as exc:
+            return f"ERROR in run_cycle: {exc}"
+
+        try:
+            positions = self.alpaca.get_open_positions()
+            symbols = ", ".join(sorted(positions.keys())) if positions else "none"
+            return f"Cycle complete. Open positions: {symbols}"
+        except Exception as exc:
+            return f"Cycle complete. (Could not fetch positions: {exc})"
+
+    def get_trade_history(self, limit: int = 200) -> List[Dict[str, Any]]:
+        return self.alpaca.get_trade_history(limit=limit)
+
+    def get_pnl_summary(self) -> Dict[str, Any]:
+        return self.alpaca.get_pnl_summary()
 
     # ---------------------------
     # Time & schedule logic
