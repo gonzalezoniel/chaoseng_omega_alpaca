@@ -10,6 +10,21 @@ except ImportError:
     tradeapi = None
 
 
+def _as_bool(value, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 class AlpacaClient:
     """
     Thin wrapper around Alpaca's REST API.
@@ -45,12 +60,7 @@ class AlpacaClient:
         self.secret_key = cfg.get("ALPACA_SECRET_KEY") or os.getenv("ALPACA_SECRET_KEY")
 
         # Paper/live flag
-        if "ALPACA_PAPER" in cfg:
-            self.paper = bool(cfg.get("ALPACA_PAPER"))
-        else:
-            # env var string -> bool
-            env_paper = os.getenv("ALPACA_PAPER", "true").lower()
-            self.paper = env_paper in ("1", "true", "yes", "y")
+        self.paper = _as_bool(cfg.get("ALPACA_PAPER", os.getenv("ALPACA_PAPER", "true")), default=True)
 
         self.tickers = cfg.get(
             "TICKERS",
@@ -123,6 +133,9 @@ class AlpacaClient:
 
     def get_account(self):
         return self.api.get_account()
+
+    def is_paper(self) -> bool:
+        return bool(self.paper)
 
     # -------------------------------------------------------------------------
     # Account / positions

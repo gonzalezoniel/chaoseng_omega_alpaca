@@ -99,6 +99,9 @@ class ChaosEngineOmegaHybrid:
         if alpaca_client is None:
             alpaca_client = AlpacaClient()  # uses your existing implementation
 
+        if not config.symbols:
+            config.symbols = list(getattr(alpaca_client, "tickers", [])) or ["SPY", "QQQ"]
+
         if model is None:
             model = OmegaModel()  # uses your existing default/weights loading
 
@@ -223,6 +226,7 @@ class ChaosEngineOmegaHybrid:
         summary = self.last_cycle_summary or {}
         return {
             "symbols": self.cfg.symbols,
+            "paper_trading": bool(getattr(self.alpaca, "is_paper", lambda: False)()),
             "market_open": summary.get("market_open", False),
             "within_trading_hours": summary.get("within_trading_hours", False),
             "open_positions": summary.get("open_positions", []),
@@ -279,7 +283,7 @@ class ChaosEngineOmegaHybrid:
 
         # 2) Max holding time enforcement
         max_delta = timedelta(minutes=self.cfg.max_hold_minutes)
-        for symbol, pos in positions.items():
+        for symbol, pos in list(positions.items()):
             entry_time = self._extract_entry_time(pos)
             if entry_time is None:
                 continue
@@ -551,8 +555,6 @@ class ChaosEngineOmegaHybrid:
             return
 
         direction = decision.get("direction")
-        confidence = decision.get("confidence", 0.0)
-
         # If direction is SHORT but shorting disabled or conditions unsafe, skip
         if direction == "SHORT" and not self.cfg.enable_shorting:
             return
