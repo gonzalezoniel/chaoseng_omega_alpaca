@@ -5,6 +5,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -80,7 +81,7 @@ class ChaosEngineOmegaHybrid:
         alpaca_client: Optional[AlpacaClient] = None,
         model: Optional[OmegaModel] = None,
         config: Optional[DayTraderConfig] = None,
-        tzinfo: timezone = timezone.utc,
+        tzinfo: timezone = ZoneInfo("America/New_York"),
     ):
         """
         Make this compatible with your existing main.py which calls
@@ -273,6 +274,7 @@ class ChaosEngineOmegaHybrid:
             if positions:
                 for symbol in list(positions.keys()):
                     self._close_position(symbol, reason="End of day flatten")
+                    positions.pop(symbol, None)
             return
 
         # 2) Max holding time enforcement
@@ -284,6 +286,7 @@ class ChaosEngineOmegaHybrid:
             hold_time = now_local - entry_time.astimezone(self.tzinfo)
             if hold_time >= max_delta:
                 self._close_position(symbol, reason="Max hold time reached")
+                positions.pop(symbol, None)
 
     def _extract_entry_time(self, pos: Any) -> Optional[datetime]:
         """
@@ -443,7 +446,9 @@ class ChaosEngineOmegaHybrid:
 
         try:
             features = self._build_features(df)
-            logits = self.model(features)  # shape [1, 3] for [short, flat, long] for example
+            self.model.eval()
+            with torch.no_grad():
+                logits = self.model(features)  # shape [batch, 3]
             probs = F.softmax(logits, dim=-1).detach().cpu().numpy()[0]
 
             short_p, flat_p, long_p = probs.tolist()
@@ -461,17 +466,26 @@ class ChaosEngineOmegaHybrid:
 
     def _build_features(self, df: pd.DataFrame) -> torch.Tensor:
         """
-        Simple feature builder. Replace/extend with your actual one.
-        """
-        closes = df["close"].values.astype(np.float32)
-        returns = np.diff(closes) / closes[:-1]
-        pad_len = max(0, 50 - len(returns))
-        if pad_len > 0:
-            returns = np.pad(returns, (pad_len, 0), mode="constant")
-        else:
-            returns = returns[-50:]
+        Build normalized OHLCV sequences for the transformer.
 
-        x = torch.from_numpy(returns).unsqueeze(0)  # shape [1, 50]
+        Returns tensor shape [seq_len, batch, features].
+        """
+        feature_cols = ["open", "high", "low", "close", "volume"]
+        raw = df[feature_cols].astype(np.float32).to_numpy()
+        seq_len = self.cfg.lookback_bars
+
+        if len(raw) >= seq_len:
+            seq = raw[-seq_len:]
+        else:
+            pad = np.repeat(raw[:1], repeats=seq_len - len(raw), axis=0)
+            seq = np.concatenate([pad, raw], axis=0)
+
+        mean = seq.mean(axis=0, keepdims=True)
+        std = seq.std(axis=0, keepdims=True)
+        std = np.where(std < 1e-6, 1.0, std)
+        seq = (seq - mean) / std
+
+        x = torch.from_numpy(seq).unsqueeze(1)  # [seq_len, 1, 5]
         return x
 
     # ---------------------------
@@ -529,6 +543,9 @@ class ChaosEngineOmegaHybrid:
         if action == "HOLD":
             return
 
+        if symbol in positions:
+            return
+
         # Don't exceed max open trades
         if len(positions) >= self.cfg.max_open_trades:
             return
@@ -567,7 +584,7 @@ class ChaosEngineOmegaHybrid:
             stop_price = price - stop_dist
             # simple reward: 1.5R
             take_profit = price + stop_dist * 1.5
-            self.alpaca.submit_bracket_order(
+            order = self.alpaca.submit_bracket_order(
                 symbol=symbol,
                 side="buy",
                 qty=qty,
@@ -575,6 +592,8 @@ class ChaosEngineOmegaHybrid:
                 stop_price=stop_price,
                 take_profit_price=take_profit,
             )
+            if order is not None:
+                positions[symbol] = order
         elif direction == "SHORT":
             # extra guard: don't short in strong uptrend regime
             regime = self._detect_market_regime(df)
@@ -583,7 +602,7 @@ class ChaosEngineOmegaHybrid:
 
             stop_price = price + stop_dist
             take_profit = price - stop_dist * 1.5
-            self.alpaca.submit_bracket_order(
+            order = self.alpaca.submit_bracket_order(
                 symbol=symbol,
                 side="sell",
                 qty=qty,
@@ -591,6 +610,8 @@ class ChaosEngineOmegaHybrid:
                 stop_price=stop_price,
                 take_profit_price=take_profit,
             )
+            if order is not None:
+                positions[symbol] = order
 
     def _estimate_atr(self, df: pd.DataFrame, period: int = 14) -> Optional[float]:
         if len(df) < period + 1:
