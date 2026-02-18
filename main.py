@@ -3,10 +3,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from chaoseng.engine import ChaosEngineOmegaHybrid
 import asyncio
+import logging
+
+logger = logging.getLogger("chaoseng")
 
 app = FastAPI()
 
-# Serve /static for CSS + JS
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
@@ -22,6 +24,25 @@ def get_engine() -> ChaosEngineOmegaHybrid:
     if engine is None:
         raise RuntimeError(engine_error or "Chaos engine unavailable.")
     return engine
+
+
+async def _trading_loop():
+    while True:
+        try:
+            if engine is not None:
+                await engine.live_step()
+        except Exception as e:
+            logger.exception(f"Background trading cycle error: {e}")
+        await asyncio.sleep(60)
+
+
+@app.on_event("startup")
+async def startup_event():
+    if engine is not None:
+        logger.info("Starting background trading loop (60s cycles)")
+        asyncio.create_task(_trading_loop())
+    else:
+        logger.error(f"Engine failed to initialize: {engine_error}")
 
 
 @app.get("/")
