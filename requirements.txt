@@ -5,3 +5,4 @@ numpy
 torch
 alpaca-trade-api
 requests
+jinja2
