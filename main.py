@@ -1,24 +1,64 @@
+import os
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
 from fastapi import FastAPI, WebSocket, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from chaoseng.engine import ChaosEngineOmegaHybrid
-import asyncio
 
-app = FastAPI()
-
-# Serve /static for CSS + JS
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+logger = logging.getLogger("chaoseng")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 engine = None
 engine_error = None
-try:
-    engine = ChaosEngineOmegaHybrid()
-except Exception as exc:
-    engine_error = str(exc)
+_scheduler_task = None
+
+SCHEDULER_INTERVAL = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60"))
 
 
-def get_engine() -> ChaosEngineOmegaHybrid:
+def _init_engine():
+    global engine, engine_error
+    try:
+        from chaoseng.engine import ChaosEngineOmegaHybrid
+        engine = ChaosEngineOmegaHybrid()
+        logger.info("Engine initialized — paper=%s symbols=%s", engine.alpaca.is_paper(), engine.cfg.symbols)
+    except Exception as exc:
+        engine_error = str(exc)
+        logger.warning("Engine unavailable: %s", engine_error)
+
+
+async def _scheduler_loop():
+    while True:
+        if engine is not None:
+            try:
+                msg = await engine.live_step()
+                logger.info("[Scheduler] %s", msg.replace("\n", " | "))
+            except Exception as exc:
+                logger.error("[Scheduler] cycle error: %s", exc)
+        await asyncio.sleep(SCHEDULER_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _scheduler_task
+    _init_engine()
+    if engine is not None:
+        _scheduler_task = asyncio.create_task(_scheduler_loop())
+        logger.info("Background scheduler started (interval=%ds)", SCHEDULER_INTERVAL)
+    yield
+    if _scheduler_task is not None:
+        _scheduler_task.cancel()
+
+
+app = FastAPI(title="Chaos Engine OMEGA", lifespan=lifespan)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+
+def get_engine():
     if engine is None:
         raise RuntimeError(engine_error or "Chaos engine unavailable.")
     return engine
@@ -26,30 +66,57 @@ def get_engine() -> ChaosEngineOmegaHybrid:
 
 @app.get("/")
 def root():
-    return {"message": "Chaos Engine OMEGA Alpaca Hybrid Ready"}
+    if engine is None:
+        return {
+            "status": "degraded",
+            "message": "Chaos Engine OMEGA — engine unavailable",
+            "error": engine_error,
+            "fix": "Set ALPACA_API_KEY and ALPACA_SECRET_KEY environment variables and redeploy.",
+        }
+    return {"status": "ok", "message": "Chaos Engine OMEGA Alpaca Hybrid Ready"}
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok" if engine is not None else "degraded",
+        "engine_ready": engine is not None,
+        "error": engine_error,
+    }
 
 
 @app.get("/dashboard")
 async def dashboard(request: Request):
+    pnl_data = None
+    status_data = None
+    history_data = None
+    if engine is not None:
+        try:
+            pnl_data = engine.get_pnl_summary()
+        except Exception:
+            pass
+        try:
+            status_data = engine.get_status()
+        except Exception:
+            pass
+        try:
+            history_data = engine.get_trade_history(limit=20)
+        except Exception:
+            pass
     return templates.TemplateResponse(
         "dashboard.html",
         {
             "request": request,
             "engine_error": engine_error,
+            "pnl": pnl_data,
+            "status": status_data,
+            "history": history_data,
         },
     )
 
 
 @app.get("/history")
 def history(limit: int = 200):
-    """
-    Return recent trade events (ENTER / EXIT) as JSON.
-    """
     try:
         return get_engine().get_trade_history(limit=limit)
     except RuntimeError as exc:
@@ -58,9 +125,6 @@ def history(limit: int = 200):
 
 @app.get("/status")
 def status():
-    """
-    Return engine status, watchlist, and last cycle metadata.
-    """
     try:
         return get_engine().get_status()
     except RuntimeError as exc:
@@ -69,9 +133,6 @@ def status():
 
 @app.get("/pnl")
 def pnl():
-    """
-    Simple realized PnL summary.
-    """
     try:
         return get_engine().get_pnl_summary()
     except RuntimeError as exc:
@@ -89,8 +150,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     while True:
         try:
-            msg = await get_engine().live_step()
+            msg = await engine.live_step()
         except Exception as e:
             msg = f"ERROR in live_step: {e}"
         await ws.send_text(msg)
-        await asyncio.sleep(60)  # 1-minute cycle
+        await asyncio.sleep(SCHEDULER_INTERVAL)

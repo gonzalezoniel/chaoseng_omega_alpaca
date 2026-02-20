@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
 numpy
-torch
+torch --index-url https://download.pytorch.org/whl/cpu
 alpaca-trade-api
 requests
 jinja2
+websockets

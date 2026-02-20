@@ -218,6 +218,51 @@ body {
   color: #93c5fd;
 }
 
+.pnl-positive {
+  color: #6ee7b7;
+}
+
+.pnl-negative {
+  color: #f87171;
+}
+
+.history-table-wrap {
+  padding: 0 16px 16px;
+  overflow-x: auto;
+}
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.history-table th {
+  text-align: left;
+  padding: 8px 12px;
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.history-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+}
+
+.side-buy {
+  color: #6ee7b7;
+  font-weight: 600;
+}
+
+.side-sell {
+  color: #f87171;
+  font-weight: 600;
+}
+
 @media (max-width: 720px) {
   .layout {
     padding: 16px;
