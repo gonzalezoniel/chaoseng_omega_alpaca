@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 engine = None
 engine_error = None
 _scheduler_task = None
+_cycle_lock = asyncio.Lock()
 
 SCHEDULER_INTERVAL = int(os.getenv("SCHEDULER_INTERVAL_SECONDS", "60"))
 
@@ -32,11 +32,12 @@ def _init_engine():
 async def _scheduler_loop():
     while True:
         if engine is not None:
-            try:
-                msg = await engine.live_step()
-                logger.info("[Scheduler] %s", msg.replace("\n", " | "))
-            except Exception as exc:
-                logger.error("[Scheduler] cycle error: %s", exc)
+            async with _cycle_lock:
+                try:
+                    msg = await engine.live_step()
+                    logger.info("[Scheduler] %s", msg.replace("\n", " | "))
+                except Exception as exc:
+                    logger.error("[Scheduler] cycle error: %s", exc)
         await asyncio.sleep(SCHEDULER_INTERVAL)
 
 
@@ -149,9 +150,10 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.send_text(">>> Connected to Chaos Engine OMEGA terminal. Waiting for first cycle...\n")
 
     while True:
-        try:
-            msg = await engine.live_step()
-        except Exception as e:
-            msg = f"ERROR in live_step: {e}"
+        async with _cycle_lock:
+            try:
+                msg = await engine.live_step()
+            except Exception as e:
+                msg = f"ERROR in live_step: {e}"
         await ws.send_text(msg)
         await asyncio.sleep(SCHEDULER_INTERVAL)
