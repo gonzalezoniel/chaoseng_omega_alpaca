@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
 numpy
 torch
 alpaca-trade-api
 requests
 jinja2
+websockets

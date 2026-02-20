@@ -4,6 +4,7 @@
   <title>Chaos Engine OMEGA – Alpaca Hybrid Terminal</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,7 +12,7 @@
     <header class="topbar">
       <div>
         <h1>Chaos Engine OMEGA</h1>
-        <p class="subtitle">Alpaca Hybrid Terminal · Live trading telemetry</p>
+        <p class="subtitle">Alpaca Hybrid Terminal · Auto-scanning every 60s</p>
       </div>
       <div class="status">
         <div class="status-item">
@@ -28,7 +29,35 @@
     {% if engine_error %}
     <section class="alert">
       <strong>Engine unavailable:</strong> {{ engine_error }}
-      <span>Set ALPACA_API_KEY / ALPACA_SECRET_KEY and redeploy to enable live cycles.</span>
+      <span>Set ALPACA_API_KEY / ALPACA_SECRET_KEY env vars and redeploy to enable live cycles.</span>
+    </section>
+    {% endif %}
+
+    {% if pnl %}
+    <section class="panel panel-compact">
+      <div class="panel-header">
+        <h2>Account Summary</h2>
+      </div>
+      <div class="snapshot-grid">
+        <div class="snapshot-card">
+          <span class="label">Equity</span>
+          <span class="snapshot-value">${{ "%.2f"|format(pnl.equity) }}</span>
+        </div>
+        <div class="snapshot-card">
+          <span class="label">Cash</span>
+          <span class="snapshot-value">${{ "%.2f"|format(pnl.cash) }}</span>
+        </div>
+        <div class="snapshot-card">
+          <span class="label">Buying Power</span>
+          <span class="snapshot-value">${{ "%.2f"|format(pnl.buying_power) }}</span>
+        </div>
+        <div class="snapshot-card">
+          <span class="label">Unrealized P&L</span>
+          <span class="snapshot-value {% if pnl.unrealized_pl >= 0 %}pnl-positive{% else %}pnl-negative{% endif %}">
+            ${{ "%.2f"|format(pnl.unrealized_pl) }}
+          </span>
+        </div>
+      </div>
     </section>
     {% endif %}
 
@@ -50,26 +79,59 @@
       <div class="snapshot-grid">
         <div class="snapshot-card">
           <span class="label">Watchlist</span>
-          <span id="watchlist" class="snapshot-value">--</span>
+          <span id="watchlist" class="snapshot-value">{% if status %}{{ status.symbols|join(', ') }}{% else %}--{% endif %}</span>
         </div>
         <div class="snapshot-card">
           <span class="label">Open positions</span>
-          <span id="positions" class="snapshot-value">--</span>
+          <span id="positions" class="snapshot-value">{% if status and status.open_positions %}{{ status.open_positions|join(', ') }}{% else %}none{% endif %}</span>
         </div>
         <div class="snapshot-card">
           <span class="label">Market open</span>
-          <span id="market-open" class="snapshot-value">--</span>
+          <span id="market-open" class="snapshot-value">{% if status %}{{ 'Yes' if status.market_open else 'No' }}{% else %}--{% endif %}</span>
         </div>
         <div class="snapshot-card">
           <span class="label">Trading window</span>
-          <span id="trading-window" class="snapshot-value">--</span>
+          <span id="trading-window" class="snapshot-value">{% if status %}{{ 'Yes' if status.within_trading_hours else 'No' }}{% else %}--{% endif %}</span>
         </div>
       </div>
       <div class="regime">
         <span class="label">Latest regimes</span>
-        <pre id="regimes" class="regime-box">--</pre>
+        <pre id="regimes" class="regime-box">{% if status and status.regimes %}{% for sym, reg in status.regimes.items() %}{{ sym }}: {{ reg }}
+{% endfor %}{% else %}--{% endif %}</pre>
       </div>
     </section>
+
+    {% if history %}
+    <section class="panel panel-compact">
+      <div class="panel-header">
+        <h2>Recent Trades</h2>
+      </div>
+      <div class="history-table-wrap">
+        <table class="history-table">
+          <thead>
+            <tr>
+              <th>Symbol</th>
+              <th>Side</th>
+              <th>Qty</th>
+              <th>Price</th>
+              <th>Filled At</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for trade in history %}
+            <tr>
+              <td>{{ trade.symbol }}</td>
+              <td class="{% if trade.side == 'buy' %}side-buy{% else %}side-sell{% endif %}">{{ trade.side|upper }}</td>
+              <td>{{ trade.qty }}</td>
+              <td>{{ trade.filled_avg_price }}</td>
+              <td>{{ trade.filled_at[:19] if trade.filled_at else '--' }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    {% endif %}
   </main>
   <script src="/static/dashboard.js"></script>
 </body>
